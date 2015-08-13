@@ -1,0 +1,194 @@
+#!/bin/sh -e
+
+### BEGIN INIT INFO
+# Provides:          office.ovpn
+# Required-Start:    $network $remote_fs $syslog
+# Required-Stop:     $network $remote_fs $syslog
+# Should-Start:      network-manager
+# Should-Stop:       network-manager
+# X-Start-Before:    $x-display-manager gdm kdm xdm wdm ldm sdm nodm
+# X-Interactive:     true
+# Default-Start:     
+# Default-Stop:      0 1 6
+# Short-Description: Openvpn VPN service
+# Description: This script will start OpenVPN tunnels as specified
+#              in /etc/default/openvpn and /etc/openvpn/*.conf
+### END INIT INFO
+
+# Original version by Robert Leslie
+# <rob@mars.org>, edited by iwj and cs
+# Modified for openvpn by Alberto Gonzalez Iniesta <agi@inittab.org>
+# Modified for restarting / starting / stopping single tunnels by Richard Mueller <mueller@teamix.net>
+
+. /lib/lsb/init-functions
+
+test $DEBIAN_SCRIPT_DEBUG && set -v -x
+
+DAEMON=/usr/sbin/openvpn
+DESC="virtual private network daemon"
+CONFIG_DIR=/root/ovpn
+NAME=office
+PIDFILE=/run/openvpn/$NAME.pid
+test -x $DAEMON || exit 1
+test -d $CONFIG_DIR || exit 1
+
+# Source defaults file; edit that file to configure this script.
+STATUSREFRESH=10
+OMIT_SENDSIGS=0
+if test -e /etc/default/openvpn; then
+  . /etc/default/openvpn
+fi
+
+start_vpn () {
+  if grep -q '^[	 ]*daemon' $CONFIG_DIR/$NAME.conf; then
+    # daemon already given in config file
+    DAEMONARG=
+  else
+    # need to daemonize
+    DAEMONARG="--daemon ovpn-$NAME"
+  fi
+
+  if grep -q '^[	 ]*status ' $CONFIG_DIR/$NAME.conf; then
+    # status file already given in config file
+    STATUSARG=""
+  elif test $STATUSREFRESH -eq 0; then
+    # default status file disabled in /etc/default/openvpn
+    STATUSARG=""
+  else
+    # prepare default status file
+    STATUSARG="--status /run/openvpn/$NAME.status $STATUSREFRESH"
+  fi
+
+  # tun using the "subnet" topology confuses the routing code that wrongly
+  # emits ICMP redirects for client to client communications
+  SAVED_DEFAULT_SEND_REDIRECTS=0
+  if grep -q '^[[:space:]]*dev[[:space:]]*tun' $CONFIG_DIR/$NAME.conf && \
+      grep -q '^[[:space:]]*topology[[:space:]]*subnet' $CONFIG_DIR/$NAME.conf; then
+    # When using "client-to-client", OpenVPN routes the traffic itself without
+    # involving the TUN/TAP interface so no ICMP redirects are sent
+    if ! grep -q '^[[:space:]]*client-to-client' $CONFIG_DIR/$NAME.conf; then
+      sysctl -w net.ipv4.conf.all.send_redirects=0 >/dev/null
+
+      # Save the default value for send_redirects before disabling it
+      # to make sure the tun device is created with send_redirects disabled
+      SAVED_DEFAULT_SEND_REDIRECTS=$(sysctl -n net.ipv4.conf.default.send_redirects)
+
+      if [ "$SAVED_DEFAULT_SEND_REDIRECTS" -ne 0 ]; then
+        sysctl -w net.ipv4.conf.default.send_redirects=0 >/dev/null
+      fi
+    fi
+  fi
+
+  log_progress_msg "$NAME"
+  STATUS=0
+
+  start-stop-daemon --start --quiet --oknodo \
+      --pidfile $PIDFILE \
+      --exec $DAEMON -- $OPTARGS --writepid $PIDFILE \
+      $DAEMONARG $STATUSARG \
+      --config $CONFIG_DIR/$NAME.conf || STATUS=1
+
+  [ "$OMIT_SENDSIGS" -ne 1 ] || ln -s -f $PIDFILE /run/sendsigs.omit.d/openvpn.$NAME.pid
+
+  # Set back the original default value of send_redirects if it was changed
+  if [ "$SAVED_DEFAULT_SEND_REDIRECTS" -ne 0 ]; then
+    sysctl -w net.ipv4.conf.default.send_redirects=$SAVED_DEFAULT_SEND_REDIRECTS >/dev/null
+  fi
+}
+
+stop_vpn () {
+  start-stop-daemon --stop --quiet --oknodo \
+      --pidfile $PIDFILE --exec $DAEMON --retry 5
+  if [ "$?" -eq 0 ]; then
+    rm -f $PIDFILE
+    [ "$OMIT_SENDSIGS" -ne 1 ] || rm -f /run/sendsigs.omit.d/openvpn.$NAME.pid
+    rm -f /run/openvpn/$NAME.status 2>/dev/null
+  fi
+}
+
+case "$1" in
+start)
+  log_daemon_msg "Starting $NAME"
+
+  # first create /run directory so it's present even
+  # when no VPN are autostarted by this script, but later
+  # by systemd openvpn@.service
+  mkdir -p /run/openvpn
+
+  if test -e $CONFIG_DIR/$NAME.conf; then
+    start_vpn
+  else
+    log_failure_msg "No such VPN: $NAME"
+    STATUS=1
+  fi
+  log_end_msg ${STATUS:-0}
+  ;;
+
+stop)
+  log_daemon_msg "Stopping $NAME"
+  if test -e $PIDFILE; then
+    stop_vpn
+    log_progress_msg "$NAME"
+  else
+    log_failure_msg " (failure: No such VPN is running: $NAME)"
+  fi
+  log_end_msg 0
+  ;;
+
+reload|force-reload)
+  # Only 'reload' running VPNs. New ones will only start with 'start' or 'restart'.
+  log_daemon_msg "Reloading $NAME"
+  # If openvpn if running under a different user than root we'll need to restart
+  if egrep '^[[:blank:]]*user[[:blank:]]' $CONFIG_DIR/$NAME.conf >/dev/null 2>&1; then
+    stop_vpn
+    start_vpn
+    log_progress_msg "(restarted)"
+  else
+    kill -HUP `cat $PIDFILE` || true
+    log_progress_msg "$NAME"
+  fi
+  log_end_msg 0
+  ;;
+
+# Only 'soft-restart' running VPNs. New ones will only start with 'start' or 'restart'.
+soft-restart)
+  log_daemon_msg "$NAME sending SIGUSR1"
+  kill -USR1 `cat $PIDFILE` || true
+  log_progress_msg "$NAME"
+  log_end_msg 0
+  ;;
+
+restart)
+  shift
+  $0 stop ${@}
+  $0 start ${@}
+  ;;
+
+cond-restart)
+  log_daemon_msg "Restarting $NAME"
+  stop_vpn
+  start_vpn
+  log_end_msg 0
+  ;;
+
+status)
+  GLOBAL_STATUS=0
+  # Returns success if all specified VPNs are defined and running
+  if test -e $CONFIG_DIR/$NAME.conf; then
+    # Config exists
+    status_of_proc -p $PIDFILE openvpn "VPN '${NAME}'" || GLOBAL_STATUS=1
+  else
+    # Config does not exist
+    log_warning_msg "VPN '$NAME': missing $CONFIG_DIR/$NAME.conf file !"
+    GLOBAL_STATUS=1
+  fi
+  exit $GLOBAL_STATUS
+  ;;
+
+*)
+  echo "Usage: $0 {start|stop|reload|restart|force-reload|cond-restart|soft-restart|status}" >&2
+  exit 1
+  ;;
+esac
+
+exit 0

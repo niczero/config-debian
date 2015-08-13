@@ -1,0 +1,17 @@
+# This service is actually a systemd target,
+# but we are using a service since targets cannot be reloaded.
+
+[Unit]
+Description=OfficeVPN service
+After=network.target
+
+[Service]
+Type=forking
+ExecStart=/usr/sbin/openvpn --cd /root/ovpn --config office.conf --daemon ovpn-office
+ExecReload=/bin/kill -HUP $MAINPID
+WorkingDirectory=/root/ovpn
+
+[Install]
+WantedBy=multi-user.target
+
+
