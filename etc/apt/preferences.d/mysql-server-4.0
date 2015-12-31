@@ -1,0 +1,7 @@
+Package: mysql-server
+Pin: origin myserver.localdomain
+Pin-Priority: 999
+
+Package: mysql-client
+Pin: origin myserver.localdomain
+Pin-Priority: 999
